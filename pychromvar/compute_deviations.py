@@ -47,6 +47,29 @@ def compute_Y(X, M, fraction, n_fragments):
 
     return Y
 
+def process_background_set_single(X, M, fraction, per_cell_sum, bg_peaks, i):
+    """Function for computing Y' for a single background set without shared memory"""
+
+    # Replace peaks for this background set
+    replacement_idx = bg_peaks[:, i]
+    rows, cols = M.nonzero()
+    new_rows = replacement_idx[rows]
+    M_r = csr_matrix((M.data, (new_rows, cols)), shape=M.shape)
+
+    # Compute (MxB)xE' 
+    obs_fragments = X @ M_r
+    tf_fraction = M_r.multiply(fraction[:, np.newaxis]).sum(axis=0).A1
+    e_fragments = (per_cell_sum[:, np.newaxis] * tf_fraction)
+    
+    # Compute MxE' 
+    tf_fraction_ = M.multiply(fraction[:, np.newaxis]).sum(axis=0).A1
+    e_fragments_ = (per_cell_sum[:, np.newaxis] * tf_fraction_)
+    
+    # Conmpute Y'
+    Y_r = (obs_fragments - e_fragments) / e_fragments_
+
+    return Y_r
+
 def compute_deviations(data: Union[AnnData, MuData], n_jobs=-1) -> AnnData:
 
     """Compute bias-corrected deviations.
@@ -97,52 +120,64 @@ def compute_deviations(data: Union[AnnData, MuData], n_jobs=-1) -> AnnData:
 
     logging.info('computing raw deviations...')
 
-    # Copy X to shared memory
-    shm_X = shared_memory.SharedMemory(create=True, size=X.nbytes)
-    shared_array = np.ndarray(X.shape, dtype=X.dtype, buffer=shm_X.buf)
-    np.copyto(shared_array, X)  
-
     # Compute Y
     Y = compute_Y(X, M, fraction, per_cell_sum)
 
-    logging.info('launching parallel jobs to compute background devs...')
-    n_jobs = cpu_count() if n_jobs == -1 else n_jobs
+    if n_jobs == 1:
 
-    # Prepare arguments for multiprocessing
-    args = [
-        (
-            i,
-            shm_X.name,
-            X.shape,
-            fraction,
-            per_cell_sum,
-            bg_peaks,
-            M.shape,
-            M.data,
-            M.indices,
-            M.indptr,
-        )
-        for i in range(N_bkg_sets)
-    ]
+        logging.info('n_jobs = 1. Not using multiprocessing...')
+        results = []
+        for i in tqdm(range(N_bkg_sets)):
+            results.append(process_background_set_single(X, M, fraction, per_cell_sum, bg_peaks, i))
+        
+        mean_Y = np.mean(results, axis=0)
+        std_Y = np.std(results, axis=0)
 
-    # Parallel computation
-    with Pool(n_jobs) as pool:
-        results = list(
-            tqdm(
-                pool.imap(process_background_set, args),
-                total=N_bkg_sets,
-                desc="processing background peak sets",
+    else:
+
+        logging.info('launching parallel jobs to compute background devs...')
+        n_jobs = cpu_count() if n_jobs == -1 else n_jobs
+
+        # Copy X to shared memory
+        shm_X = shared_memory.SharedMemory(create=True, size=X.nbytes)
+        shared_array = np.ndarray(X.shape, dtype=X.dtype, buffer=shm_X.buf)
+        np.copyto(shared_array, X)  
+
+        # Prepare arguments for multiprocessing
+        args = [
+            (
+                i,
+                shm_X.name,
+                X.shape,
+                fraction,
+                per_cell_sum,
+                bg_peaks,
+                M.shape,
+                M.data,
+                M.indices,
+                M.indptr,
             )
-        )
+            for i in range(N_bkg_sets)
+        ]
 
-    # Compute mean and standard deviation
-    logging.info('computing mean and std dev of background devs...')
-    mean_Y = np.mean(results, axis=0)
-    std_Y = np.std(results, axis=0)
+        # Parallel computation
+        with Pool(n_jobs) as pool:
+            results = list(
+                tqdm(
+                    pool.imap(process_background_set, args),
+                    total=N_bkg_sets,
+                    desc="processing background peak sets",
+                )
+            )
 
-    # Cleanup shared memory
-    shm_X.close()
-    shm_X.unlink()
+        # Compute mean and standard deviation
+        logging.info('computing mean and std dev of background devs...')
+        mean_Y = np.mean(results, axis=0)
+        std_Y = np.std(results, axis=0)
+
+        # Cleanup shared memory
+        shm_X.close()
+        shm_X.unlink()
 
     # Compute bias-corrected deviations
     logging.info('calculate bias corrected deviations...')
